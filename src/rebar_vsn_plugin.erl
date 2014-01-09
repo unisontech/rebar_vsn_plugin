@@ -51,7 +51,22 @@ make_vsn() ->
 process_app_vsn(Config, AppFile) ->
     case get_app_meta(Config, AppFile) of
         {ok, {AppName, SrcDetail}} ->
-            case proplists:get_value(vsn, SrcDetail) of
+            VsnOpts = rebar_config:get(Config, vsn_opts, []),
+
+            IsOverrided =
+                case proplists:get_value(override_vsn_for_apps, VsnOpts, false) of
+                    false -> false;
+                    {incl, Pattern} -> check_if_app_overrided(AppName, Pattern);
+                    {excl, Pattern} -> not(check_if_app_overrided(AppName, Pattern))
+                end,
+
+            Version =
+                if
+                    IsOverrided -> proplists:get_value(override_vsn, VsnOpts);
+                    true        -> proplists:get_value(vsn, SrcDetail)
+                end,
+
+            case Version of
                 "semver" ->
                     do_default_replacement(AppName, Config, AppFile);
                 semver ->
@@ -64,6 +79,14 @@ process_app_vsn(Config, AppFile) ->
             end;
         {error, _} ->
             ok
+    end.
+
+check_if_app_overrided(AppName, [H | _] = AppsList) when is_atom(H) ->
+    lists:member(AppName, AppsList);
+check_if_app_overrided(AppName, Regexp) ->
+    case re:run(atom_to_list(AppName), Regexp) of
+        {match, _} -> true;
+        nomatch    -> false
     end.
 
 check_smart_replacement(AppName, Config, AppFile, Vsn) ->
