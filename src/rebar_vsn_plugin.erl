@@ -66,20 +66,51 @@ process_app_vsn(Config, AppFile) ->
                     true        -> proplists:get_value(vsn, SrcDetail)
                 end,
 
-            case Version of
-                "semver" ->
-                    do_default_replacement(AppName, Config, AppFile);
-                semver ->
-                    do_default_replacement(AppName, Config, AppFile);
-                Vsn when erlang:is_list(Vsn);
-                         erlang:is_binary(Vsn) ->
-                    check_smart_replacement(AppName, Config, AppFile, Vsn);
-                _ ->
-                    ok
+            FinaleVersion =
+                case Version of
+                    {custom, CustomVersion} ->
+                        process_custom_version(CustomVersion);
+                    Semver when Semver =:= "semver" orelse
+                                Semver =:= semver ->
+                        {TagVsn, RawRef, RawCount} = collect_default_refcount(),
+                        build_vsn_string(TagVsn, RawRef, RawCount);
+                    Vsn when erlang:is_list(Vsn);
+                             erlang:is_binary(Vsn) ->
+                        check_smart_replacement(AppName, Config, AppFile, Vsn);
+                    _ ->
+                        false
+                end,
+            rebar_log:log(warn, "VERSION: ~p~n", [FinaleVersion]),
+            case FinaleVersion of
+                false -> ok;
+                _     -> rewrite_vsn(Config, AppName, AppFile, FinaleVersion)
             end;
         {error, _} ->
             ok
     end.
+
+process_custom_version(CustomVersion) ->
+    binary_to_list(iolist_to_binary(lists:map(fun do_process_custom_version/1, CustomVersion))).
+
+do_process_custom_version({env_var, VariableName}) ->
+    case os:getenv(VariableName) of
+        false -> "";
+        Value -> Value
+    end;
+do_process_custom_version(epoch) ->
+    {MegaSecs, Secs, _MicroSecs} = erlang:now(),
+    integer_to_list((MegaSecs * 1000000) + Secs);
+do_process_custom_version(git_ref) ->
+    {_TagVsn, RawRef, _RawCount} = collect_default_refcount(),
+    RawRef;
+do_process_custom_version(git_tag) ->
+    {TagVsn, _RawRef, _RawCount} = collect_default_refcount(),
+    TagVsn;
+do_process_custom_version(commits_number) ->
+    {_TagVsn, _RawRef, RawCount} = collect_default_refcount(),
+    RawCount;
+do_process_custom_version(ConstString) ->
+    ConstString.
 
 check_if_app_overrided(AppName, [H | _] = AppsList) when is_atom(H) ->
     lists:member(AppName, AppsList);
@@ -92,13 +123,13 @@ check_if_app_overrided(AppName, Regexp) ->
 check_smart_replacement(AppName, Config, AppFile, Vsn) ->
     case rebar_config:get_local(Config, plugins, []) of
         [] ->
-            ok;
+            false;
         PluginList ->
             case lists:member(?MODULE, PluginList) of
                 true ->
                     do_smart_replacement(AppName, Config, AppFile, Vsn);
                 false ->
-                    ok
+                    false
             end
     end.
 
@@ -113,11 +144,11 @@ do_smart_replacement(AppName, Config, AppFile, Vsn) ->
                end,
     figure_out_patch_version(Config, AppName, LocalAppFile, Ref, Vsn).
 
-figure_out_patch_version(Config, AppName, AppFile, workspace, Vsn) ->
-    rewrite_vsn(Config, AppName, AppFile, Vsn, undefined, <<"0">>);
-figure_out_patch_version(Config, AppName, AppFile, Ref, Vsn) ->
+figure_out_patch_version(_Config, _AppName, _AppFile, workspace, Vsn) ->
+    build_vsn_string(Vsn, undefined, <<"0">>);
+figure_out_patch_version(_Config, _AppName, _AppFile, Ref, Vsn) ->
     RawCount = get_patch_count(Ref),
-    rewrite_vsn(Config, AppName, AppFile, Vsn, Ref, RawCount).
+    build_vsn_string(Vsn, Ref, RawCount).
 
 find_change_ref([], _LocalAppFile, _LastRevision, _Vsn) ->
     {no_ref, "0.0.0"};
@@ -142,32 +173,30 @@ get_revision_list(AppFile) ->
    string:tokens(os:cmd(io_lib:format("git log --format=%h -- ~s~n", [AppFile])),
                  "\n\r").
 
+get_ref() ->
+    re:replace(os:cmd("git log -n 1 --pretty=format:'%h\n' "),  "\\s", "", [global]).
+get_ref_count() ->
+    re:replace(os:cmd("git rev-list HEAD | wc -l"), "\\s", "", [global]).
+
 collect_default_refcount() ->
     %% Get the tag timestamp and minimal ref from the system. The
     %% timestamp is really important from an ordering perspective.
-    RawRef = os:cmd("git log -n 1 --pretty=format:'%h\n' "),
+    RawRef = get_ref(),
 
     {Tag, TagVsn} = parse_tags(),
     RawCount =
         case Tag of
-            undefined ->
-                os:cmd("git rev-list HEAD | wc -l");
-            _ ->
-                get_patch_count(RawRef)
+            undefined -> get_ref_count();
+            _ -> get_patch_count(RawRef)
         end,
     {TagVsn, RawRef, RawCount}.
 
-do_default_replacement(AppName, Config, AppFile) ->
-    {TagVsn, RawRef, RawCount} = collect_default_refcount(),
-    rewrite_vsn(Config, AppName, AppFile, TagVsn, RawRef, RawCount).
-
-rewrite_vsn(Config, AppName, AppFile, Vsn, RawRef, RawCount) ->
+rewrite_vsn(Config, AppName, AppFile, Vsn) ->
     EbinAppFile= filename:join("ebin", erlang:atom_to_list(AppName) ++ ".app"),
     case get_app_meta(Config, EbinAppFile) of
         {ok, {AppName, Details0}} ->
-            NewVsn = build_vsn_string(Vsn, RawRef, RawCount),
             %% Replace the old version with the new one
-            Details1 = lists:keyreplace(vsn, 1, Details0, {vsn, NewVsn}),
+            Details1 = lists:keyreplace(vsn, 1, Details0, {vsn, Vsn}),
             write_app_file(EbinAppFile, {application, AppName, Details1}),
             update_config(Config, AppName, AppFile, Details1);
         {error, _} ->
@@ -181,9 +210,9 @@ build_vsn_string(Vsn, RawRef, RawCount) ->
                  undefined ->
                      "";
                  RawRef ->
-                     [".ref", re:replace(RawRef, "\\s", "", [global])]
+                     [".ref", RawRef]
              end,
-    Count = erlang:iolist_to_binary(re:replace(RawCount, "\\s", "", [global])),
+    Count = erlang:iolist_to_binary(RawCount),
 
     %% Create the valid [semver](http://semver.org) version from the tag
     case Count of
